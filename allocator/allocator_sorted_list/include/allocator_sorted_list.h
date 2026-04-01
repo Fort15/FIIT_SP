@@ -14,12 +14,26 @@ class allocator_sorted_list final:
 {
 
 private:
+
+    struct allocator_meta {
+        std::pmr::memory_resource *parent_allocator;
+        allocator_with_fit_mode::fit_mode mode;
+        size_t total_size;
+        std::mutex mtx;
+        void* first_free_block; 
+    };
+
+
+    struct block_metadata {
+        void* next_free_block;
+        size_t size;
+    };
     
     void *_trusted_memory;
 
-    static constexpr const size_t allocator_metadata_size = sizeof(std::pmr::memory_resource *) + sizeof(fit_mode) + sizeof(size_t) + sizeof(std::mutex) + sizeof(void*);
+    static constexpr const size_t allocator_metadata_size = sizeof(allocator_meta);
 
-    static constexpr const size_t block_metadata_size = sizeof(void*) + sizeof(size_t);
+    static constexpr const size_t block_metadata_size = sizeof(block_metadata);
 
 public:
 
