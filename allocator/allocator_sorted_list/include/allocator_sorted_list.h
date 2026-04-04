@@ -27,6 +27,7 @@ private:
     struct block_metadata {
         void* next_free_block;
         size_t size;
+        bool is_free;
     };
     
     void *_trusted_memory;

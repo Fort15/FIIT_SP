@@ -1,8 +1,25 @@
 #include <not_implemented.h>
 #include "../include/allocator_sorted_list.h"
 
+// ========================
+// ФУНКЦИИ ДЛЯ ВЫРАВНИВАНИЯ
+// ========================
+
+static constexpr std::size_t get_max_alignment() noexcept {
+    return alignof(std::max_align_t);
+}
+
+// сдвигает ptr вперёд к ближайшему адресу кратному alignment
+// при этом уменьшая avaible_space на величину сдвига
+static bool align_pointer(void*& ptr, size_t& available_space, 
+                         std::size_t alignment, std::size_t size) noexcept {
+    return std::align(alignment, size, ptr, available_space) != nullptr;
+}
+
 allocator_sorted_list::~allocator_sorted_list()
 {
+    if (_trusted_memory == nullptr) return;
+
     auto *meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
     auto *parent = meta->parent_allocator;
     size_t total_size = meta->total_size + allocator_metadata_size;
@@ -22,7 +39,12 @@ allocator_sorted_list &allocator_sorted_list::operator=(
     allocator_sorted_list &&other) noexcept
 {
     if (this != &other) {
-        if (_trusted_memory != nullptr) this->~allocator_sorted_list();
+        if (_trusted_memory != nullptr) {
+            auto* meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
+            meta->~allocator_meta();
+            meta->parent_allocator->deallocate(_trusted_memory, 
+                allocator_metadata_size + meta->total_size);
+        }
         _trusted_memory = other._trusted_memory;
         other._trusted_memory = nullptr;
     }
@@ -36,20 +58,39 @@ allocator_sorted_list::allocator_sorted_list(
 {
     if (parent_allocator == nullptr) parent_allocator = std::pmr::get_default_resource();
 
-    _trusted_memory = parent_allocator->allocate(space_size + allocator_metadata_size);
+    constexpr size_t max_align = get_max_alignment();
+    size_t total_requested = allocator_metadata_size + space_size + max_align;
+    _trusted_memory = parent_allocator->allocate(total_requested    );
+    if (!_trusted_memory) throw std::bad_alloc();
 
-    auto *meta = new (_trusted_memory) allocator_meta();
-    meta->parent_allocator = parent_allocator;
-    meta->mode = allocate_fit_mode;
-    meta->total_size = space_size;
+    try {
+        auto *meta = new (_trusted_memory) allocator_meta();
+        meta->parent_allocator = parent_allocator;
+        meta->mode = allocate_fit_mode;
+        meta->total_size = space_size;
 
-    void *first_block_adr = static_cast<std::byte*>(_trusted_memory) + allocator_metadata_size;
+        void *first_block_adr = static_cast<std::byte*>(_trusted_memory) + allocator_metadata_size;
+        size_t available = space_size + max_align;
+        if (!align_pointer(first_block_adr, available, alignof(block_metadata), block_metadata_size)) {
+            meta->~allocator_meta();
+            parent_allocator->deallocate(_trusted_memory, total_requested);
+            _trusted_memory = nullptr;
+            throw std::bad_alloc();
+        }
 
-    auto *first_block = new (first_block_adr) block_metadata();
-    first_block->size = space_size - block_metadata_size;
-    first_block->next_free_block = nullptr;
+        auto *first_block = new (first_block_adr) block_metadata();
+        first_block->size = available - block_metadata_size;
+        first_block->next_free_block = nullptr;
+        first_block->is_free = true;
 
-    meta->first_free_block = first_block_adr;
+        meta->first_free_block = first_block_adr;
+    } catch (...) {
+        if (_trusted_memory) {
+            parent_allocator->deallocate(_trusted_memory, total_requested);
+            _trusted_memory = nullptr;
+        }
+        throw;
+    }
 }
 
 [[nodiscard]] void *allocator_sorted_list::do_allocate_sm(
@@ -95,6 +136,7 @@ allocator_sorted_list::allocator_sorted_list(
         auto *next_free = new (new_block_adr) block_metadata();
         next_free->size = target_cur->size - size - block_metadata_size;
         next_free->next_free_block = target_cur->next_free_block;
+        next_free->is_free = true;
 
         if (target_prev) target_prev->next_free_block = next_free;
         else meta->first_free_block = next_free;
@@ -105,16 +147,23 @@ allocator_sorted_list::allocator_sorted_list(
         else meta->first_free_block = target_cur->next_free_block;
     }
 
+    target_cur->is_free = false;
     target_cur->next_free_block = nullptr;
     
     return reinterpret_cast<std::byte*>(target_cur) + block_metadata_size;
 }
 
 allocator_sorted_list::allocator_sorted_list(const allocator_sorted_list &other)
-{}
+{
+    throw not_implemented("allocator_sorted_list::allocator_sorted_list(const allocator_sorted_list &other)",
+                        "no copy constructor");
+}
 
 allocator_sorted_list &allocator_sorted_list::operator=(const allocator_sorted_list &other)
-{}
+{
+    throw not_implemented("allocator_sorted_list &allocator_sorted_list::operator=(const allocator_sorted_list &other)",
+                        "no copy assignment");
+}
 
 bool allocator_sorted_list::do_is_equal(const std::pmr::memory_resource &other) const noexcept
 {
@@ -133,9 +182,23 @@ void allocator_sorted_list::do_deallocate_sm(
 
     auto *meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
 
+    void* pool_start = static_cast<std::byte*>(_trusted_memory) + allocator_metadata_size;
+    size_t available_for_check = meta->total_size + get_max_alignment();
+    
+    align_pointer(pool_start, available_for_check, alignof(block_metadata), block_metadata_size);
+    
+    void* pool_end = static_cast<std::byte*>(pool_start) + available_for_check;
+    auto* raw_at = static_cast<std::byte*>(at);
+    
+    if (raw_at < pool_start || raw_at >= pool_end) {
+        throw std::logic_error("Pointer does not belong to this allocator");
+    }
+    
     std::lock_guard<std::mutex> lock(meta->mtx);
 
     auto *target = reinterpret_cast<block_metadata*>(static_cast<std::byte*>(at) - block_metadata_size);
+
+    target->is_free = true;
 
     block_metadata *prev = nullptr;
     block_metadata *cur = reinterpret_cast<block_metadata*>(meta->first_free_block);
@@ -285,8 +348,10 @@ allocator_sorted_list::sorted_iterator &allocator_sorted_list::sorted_iterator::
         }
 
         std::byte *next_ptr = static_cast<std::byte*>(_current_ptr) + block_metadata_size + block->size;
-        std::byte *end_ptr = static_cast<std::byte*>(_trusted_memory) + allocator_metadata_size + meta->total_size;
-
+        void* aligned_start = static_cast<std::byte*>(_trusted_memory) + allocator_metadata_size;
+        size_t available = meta->total_size + get_max_alignment();
+        align_pointer(aligned_start, available, alignof(block_metadata), block_metadata_size);
+        std::byte *end_ptr = static_cast<std::byte*>(aligned_start) + available;
         if (next_ptr >= end_ptr) _current_ptr = nullptr;
         else _current_ptr = next_ptr;
     }
@@ -318,7 +383,7 @@ allocator_sorted_list::sorted_iterator::sorted_iterator(void *trusted)
     if (trusted == nullptr) {
         _current_ptr = nullptr;
         _free_ptr = nullptr;
-    }else {
+    } else {
         auto *meta = reinterpret_cast<allocator_meta*>(trusted);
         _current_ptr = static_cast<std::byte*>(trusted) + allocator_metadata_size;
         _free_ptr = meta->first_free_block;
@@ -328,5 +393,7 @@ allocator_sorted_list::sorted_iterator::sorted_iterator(void *trusted)
 
 bool allocator_sorted_list::sorted_iterator::occupied() const noexcept
 {   
-    return _current_ptr != _free_ptr;
+    if (_current_ptr == nullptr) return false;
+    auto* block = reinterpret_cast<block_metadata*>(_current_ptr);
+    return !block->is_free;
 }
