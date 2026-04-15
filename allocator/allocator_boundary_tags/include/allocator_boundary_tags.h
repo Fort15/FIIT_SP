@@ -15,10 +15,25 @@ class allocator_boundary_tags final :
 
 private:
 
-    static constexpr const size_t allocator_metadata_size = sizeof(memory_resource*) + sizeof(allocator_with_fit_mode::fit_mode) +
-                                                            sizeof(size_t) + sizeof(std::mutex) + sizeof(void*);
+    struct allocator_meta {
+        std::pmr::memory_resource *parent_allocator;
+        allocator_with_fit_mode::fit_mode mode;
+        size_t total_size;
+        size_t allocated_size;
+        std::mutex mtx;
+        void *first_occupied;
+    };
 
-    static constexpr const size_t occupied_block_metadata_size = sizeof(size_t) + sizeof(void*) + sizeof(void*) + sizeof(void*);
+    struct block_metadata {
+        size_t block_size;
+        void *previous_block;
+        void *next_block;
+        void *owner;
+    };
+
+    static constexpr const size_t allocator_metadata_size = sizeof(allocator_meta);
+
+    static constexpr const size_t occupied_block_metadata_size = sizeof(block_metadata);
 
     static constexpr const size_t free_block_metadata_size = 0;
 
@@ -28,9 +43,9 @@ public:
     
     ~allocator_boundary_tags() override;
     
-    allocator_boundary_tags(allocator_boundary_tags const &other);
+    allocator_boundary_tags(allocator_boundary_tags const &other) = delete;
     
-    allocator_boundary_tags &operator=(allocator_boundary_tags const &other);
+    allocator_boundary_tags &operator=(allocator_boundary_tags const &other) = delete;
     
     allocator_boundary_tags(
         allocator_boundary_tags &&other) noexcept;
@@ -65,6 +80,14 @@ public:
     std::vector<allocator_test_utils::block_info> get_blocks_info() const override;
 
 private:
+
+    void release_trusted_memory() noexcept;
+
+    void *pool_begin() const noexcept;
+
+    void *pool_end() const noexcept;
+
+    block_metadata *find_block_by_payload(void *payload) const;
 
     std::vector<allocator_test_utils::block_info> get_blocks_info_inner() const override;
 

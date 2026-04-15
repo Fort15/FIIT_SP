@@ -40,12 +40,15 @@ allocator_sorted_list::allocator_sorted_list(
 allocator_sorted_list &allocator_sorted_list::operator=(
     allocator_sorted_list &&other) noexcept
 {
-    /////
     if (this != &other) {
-        auto* meta2 = reinterpret_cast<allocator_meta*>(_trusted_memory);
-        meta2->~allocator_meta();
-        auto *meta = reinterpret_cast<allocator_meta*>(other._trusted_memory);
-        std::lock_guard<std::mutex> lock(meta->mtx);
+        auto* this_meta = _trusted_memory ? reinterpret_cast<allocator_meta*>(_trusted_memory) : nullptr;
+        auto* other_meta = other._trusted_memory ? reinterpret_cast<allocator_meta*>(other._trusted_memory) : nullptr;
+
+        std::scoped_lock lock(this_meta->mtx, other_meta->mtx);
+        if (_trusted_memory != nullptr)
+        {
+            this_meta->parent_allocator->deallocate(_trusted_memory, this_meta->total_size);
+        }
         _trusted_memory = other._trusted_memory;
         other._trusted_memory = nullptr;
     }
@@ -154,22 +157,11 @@ allocator_sorted_list::allocator_sorted_list(
     }
 
     target_cur->is_free = false;
-    target_cur->next_free_block = nullptr;
+    target_cur->next_free_block = _trusted_memory;
     
     return reinterpret_cast<std::byte*>(target_cur) + block_metadata_size;
 }
 
-allocator_sorted_list::allocator_sorted_list(const allocator_sorted_list &other)
-{
-    throw not_implemented("allocator_sorted_list::allocator_sorted_list(const allocator_sorted_list &other)",
-                        "no copy constructor");
-}
-
-allocator_sorted_list &allocator_sorted_list::operator=(const allocator_sorted_list &other)
-{
-    throw not_implemented("allocator_sorted_list &allocator_sorted_list::operator=(const allocator_sorted_list &other)",
-                        "no copy assignment");
-}
 
 bool allocator_sorted_list::do_is_equal(const std::pmr::memory_resource &other) const noexcept
 {
@@ -197,7 +189,6 @@ void allocator_sorted_list::do_deallocate_sm(
     auto* raw_at = static_cast<std::byte*>(at);
     
 
-    //
     if (raw_at < pool_start || raw_at >= pool_end) {
         throw std::logic_error("Pointer does not belong to this allocator");
     }
@@ -205,6 +196,14 @@ void allocator_sorted_list::do_deallocate_sm(
     std::lock_guard<std::mutex> lock(meta->mtx);
 
     auto *target = reinterpret_cast<block_metadata*>(static_cast<std::byte*>(at) - block_metadata_size);
+
+    if (target->next_free_block != _trusted_memory) {
+        throw std::logic_error("Block was not allocated by this allocator");
+    }
+
+    if (target->is_free) {
+        throw std::logic_error("Double free detected");
+    }
 
     target->is_free = true;
 
