@@ -19,6 +19,7 @@ private:
         std::pmr::memory_resource *parent_allocator;
         allocator_with_fit_mode::fit_mode mode;
         size_t total_size;
+        size_t allocated_size;
         std::mutex mtx;
         void* first_free_block; 
     };

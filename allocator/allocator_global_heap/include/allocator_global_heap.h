@@ -14,7 +14,6 @@ private:
 
     static constexpr const size_t size_t_size = sizeof(size_t);
 
-    mutable std::mutex _mutex;
 
 public:
     

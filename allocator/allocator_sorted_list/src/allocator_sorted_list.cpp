@@ -25,12 +25,14 @@ allocator_sorted_list::~allocator_sorted_list()
     size_t total_size = meta->total_size + allocator_metadata_size;
 
     meta->~allocator_meta();
-    parent->deallocate(_trusted_memory, total_size);
+    parent->deallocate(_trusted_memory, meta->allocated_size);
 }
 
 allocator_sorted_list::allocator_sorted_list(
     allocator_sorted_list &&other) noexcept
 {
+    auto *meta = reinterpret_cast<allocator_meta*>(other._trusted_memory);
+    std::lock_guard<std::mutex> lock(meta->mtx);
     _trusted_memory = other._trusted_memory;
     other._trusted_memory = nullptr;
 }
@@ -38,13 +40,12 @@ allocator_sorted_list::allocator_sorted_list(
 allocator_sorted_list &allocator_sorted_list::operator=(
     allocator_sorted_list &&other) noexcept
 {
+    /////
     if (this != &other) {
-        if (_trusted_memory != nullptr) {
-            auto* meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
-            meta->~allocator_meta();
-            meta->parent_allocator->deallocate(_trusted_memory, 
-                allocator_metadata_size + meta->total_size);
-        }
+        auto* meta2 = reinterpret_cast<allocator_meta*>(_trusted_memory);
+        meta2->~allocator_meta();
+        auto *meta = reinterpret_cast<allocator_meta*>(other._trusted_memory);
+        std::lock_guard<std::mutex> lock(meta->mtx);
         _trusted_memory = other._trusted_memory;
         other._trusted_memory = nullptr;
     }
@@ -60,7 +61,7 @@ allocator_sorted_list::allocator_sorted_list(
 
     constexpr size_t max_align = get_max_alignment();
     size_t total_requested = allocator_metadata_size + space_size + max_align;
-    _trusted_memory = parent_allocator->allocate(total_requested    );
+    _trusted_memory = parent_allocator->allocate(total_requested);
     if (!_trusted_memory) throw std::bad_alloc();
 
     try {
@@ -68,6 +69,7 @@ allocator_sorted_list::allocator_sorted_list(
         meta->parent_allocator = parent_allocator;
         meta->mode = allocate_fit_mode;
         meta->total_size = space_size;
+        meta->allocated_size = total_requested;
 
         void *first_block_adr = static_cast<std::byte*>(_trusted_memory) + allocator_metadata_size;
         size_t available = space_size + max_align;
@@ -99,13 +101,17 @@ allocator_sorted_list::allocator_sorted_list(
     auto *meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
     std::lock_guard<std::mutex> lock(meta->mtx);
 
+    constexpr size_t align = alignof(block_metadata);
+
+    // округление вверх до числа кратного align
+    size_t aligned_size = (size + align - 1) & ~(align - 1);
+
     block_metadata *prev = nullptr;
     block_metadata *cur = reinterpret_cast<block_metadata*>(meta->first_free_block);
-
     block_metadata *target_prev = nullptr, *target_cur = nullptr;
 
     while (cur != nullptr) {
-        if (cur->size >= size) {
+        if (cur->size >= aligned_size) {
             if (meta->mode == allocator_with_fit_mode::fit_mode::first_fit) {
                 target_cur = cur;
                 target_prev = prev;
@@ -130,18 +136,18 @@ allocator_sorted_list::allocator_sorted_list(
 
     if (!target_cur) throw std::bad_alloc();
 
-    if (target_cur->size >= size + block_metadata_size + 1) {
-        std::byte *new_block_adr = reinterpret_cast<std::byte*>(target_cur) + size + block_metadata_size;
+    if (target_cur->size >= aligned_size + block_metadata_size + 1) {
+        std::byte *new_block_adr = reinterpret_cast<std::byte*>(target_cur) + aligned_size + block_metadata_size;
 
         auto *next_free = new (new_block_adr) block_metadata();
-        next_free->size = target_cur->size - size - block_metadata_size;
+        next_free->size = target_cur->size - aligned_size - block_metadata_size;
         next_free->next_free_block = target_cur->next_free_block;
         next_free->is_free = true;
 
         if (target_prev) target_prev->next_free_block = next_free;
         else meta->first_free_block = next_free;
 
-        target_cur->size = size;
+        target_cur->size = aligned_size;
     } else {
         if (target_prev) target_prev->next_free_block = target_cur->next_free_block;
         else meta->first_free_block = target_cur->next_free_block;
@@ -190,6 +196,8 @@ void allocator_sorted_list::do_deallocate_sm(
     void* pool_end = static_cast<std::byte*>(pool_start) + available_for_check;
     auto* raw_at = static_cast<std::byte*>(at);
     
+
+    //
     if (raw_at < pool_start || raw_at >= pool_end) {
         throw std::logic_error("Pointer does not belong to this allocator");
     }
@@ -383,11 +391,16 @@ allocator_sorted_list::sorted_iterator::sorted_iterator(void *trusted)
     if (trusted == nullptr) {
         _current_ptr = nullptr;
         _free_ptr = nullptr;
+        _trusted_memory = nullptr;
     } else {
-        auto *meta = reinterpret_cast<allocator_meta*>(trusted);
-        _current_ptr = static_cast<std::byte*>(trusted) + allocator_metadata_size;
-        _free_ptr = meta->first_free_block;
         _trusted_memory = trusted;
+        auto *meta = reinterpret_cast<allocator_meta*>(trusted);
+        void* pool_start = static_cast<std::byte*>(trusted) + allocator_metadata_size;
+        size_t available = meta->total_size + get_max_alignment();
+        align_pointer(pool_start, available, alignof(block_metadata), block_metadata_size);
+
+        _current_ptr = pool_start;
+        _free_ptr = meta->first_free_block;
     }
 }
 
