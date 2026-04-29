@@ -77,7 +77,15 @@ allocator_boundary_tags::block_metadata *allocator_boundary_tags::find_block_by_
 
 allocator_boundary_tags::~allocator_boundary_tags()
 {
-    release_trusted_memory();
+    if (_trusted_memory == nullptr) return;
+
+    auto *meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
+    auto *parent = meta->parent_allocator;
+    size_t allocated_size = meta->allocated_size;
+
+    meta->~allocator_meta();
+    parent->deallocate(_trusted_memory, allocated_size);
+    _trusted_memory = nullptr;
 }
 
 allocator_boundary_tags::allocator_boundary_tags(allocator_boundary_tags &&other) noexcept
@@ -361,11 +369,6 @@ std::vector<allocator_test_utils::block_info> allocator_boundary_tags::get_block
 bool allocator_boundary_tags::do_is_equal(const std::pmr::memory_resource &other) const noexcept
 {
     if (this == &other) return true;
-
-    auto *other_allocator = dynamic_cast<allocator_boundary_tags const*>(&other);
-    if (other_allocator == nullptr) return false;
-
-    return _trusted_memory == other_allocator->_trusted_memory;
 }
 
 bool allocator_boundary_tags::boundary_iterator::operator==(
@@ -411,12 +414,27 @@ allocator_boundary_tags::boundary_iterator &allocator_boundary_tags::boundary_it
     return *this;
 }
 
+std::byte *allocator_boundary_tags::boundary_iterator::pool_begin_bytes() const noexcept
+{
+    if (_trusted_memory == nullptr) return nullptr;
+
+    auto *meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
+    void *begin = static_cast<std::byte*>(_trusted_memory) + allocator_metadata_size;
+    size_t available_space = meta->total_size + get_block_alignment();
+
+    if (!align_pointer(begin, available_space, get_block_alignment(), occupied_block_metadata_size)) {
+        return nullptr;
+    }
+
+    return static_cast<std::byte*>(begin);
+}
+
 allocator_boundary_tags::boundary_iterator &allocator_boundary_tags::boundary_iterator::operator--() & noexcept
 {
     if (_trusted_memory == nullptr) return *this;
 
     auto *meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
-    auto *memory_begin = static_cast<std::byte*>(_trusted_memory) + allocator_metadata_size;
+    auto *memory_begin = pool_begin_bytes();
 
     if (_occupied) {
         auto *block = reinterpret_cast<block_metadata*>(_occupied_ptr);
@@ -474,7 +492,7 @@ size_t allocator_boundary_tags::boundary_iterator::size() const noexcept
     if (_trusted_memory == nullptr) return 0;
 
     auto *meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
-    auto *begin = static_cast<std::byte*>(_trusted_memory) + allocator_metadata_size;
+    auto *begin = pool_begin_bytes();
     auto *end = begin + meta->total_size;
 
     if (_occupied) {
@@ -531,7 +549,7 @@ allocator_boundary_tags::boundary_iterator::boundary_iterator(void *trusted)
     auto *meta = reinterpret_cast<allocator_meta*>(trusted);
     if (meta->first_occupied == nullptr) return;
 
-    auto *begin = static_cast<std::byte*>(trusted) + allocator_metadata_size;
+    auto *begin = pool_begin_bytes(); 
     _occupied_ptr = meta->first_occupied;
     _occupied = _occupied_ptr == begin;
 }
@@ -540,14 +558,24 @@ void *allocator_boundary_tags::boundary_iterator::get_ptr() const noexcept
 {
     if (_trusted_memory == nullptr) return nullptr;
 
-    auto *begin = static_cast<std::byte*>(_trusted_memory) + allocator_metadata_size;
+    auto *begin = pool_begin_bytes();
 
     if (_occupied) {
         return _occupied_ptr;
     }
 
     if (_occupied_ptr == nullptr) {
-        return begin;
+        auto *meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
+        if (meta->first_occupied == nullptr) {
+            return begin;
+        }
+
+        auto *last = reinterpret_cast<block_metadata*>(meta->first_occupied);
+        while (last->next_block != nullptr) {
+            last = reinterpret_cast<block_metadata*>(last->next_block);
+        }
+
+        return reinterpret_cast<std::byte*>(last) + last->block_size;
     }
 
     auto *next_block = reinterpret_cast<block_metadata*>(_occupied_ptr);

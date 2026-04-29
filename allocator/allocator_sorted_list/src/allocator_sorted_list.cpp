@@ -37,21 +37,59 @@ allocator_sorted_list::allocator_sorted_list(
     other._trusted_memory = nullptr;
 }
 
-allocator_sorted_list &allocator_sorted_list::operator=(
-    allocator_sorted_list &&other) noexcept
+allocator_sorted_list& allocator_sorted_list::operator=(
+    allocator_sorted_list&& other) noexcept
 {
-    if (this != &other) {
-        auto* this_meta = _trusted_memory ? reinterpret_cast<allocator_meta*>(_trusted_memory) : nullptr;
-        auto* other_meta = other._trusted_memory ? reinterpret_cast<allocator_meta*>(other._trusted_memory) : nullptr;
+    if (this == &other) {
+        return *this;
+    }
 
-        std::scoped_lock lock(this_meta->mtx, other_meta->mtx);
-        if (_trusted_memory != nullptr)
+    void* old_memory = nullptr;
+    std::pmr::memory_resource* old_parent = nullptr;
+    size_t old_allocated_size = 0;
+
+    if (_trusted_memory != nullptr && other._trusted_memory != nullptr) {
+        auto* this_meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
+        auto* other_meta = reinterpret_cast<allocator_meta*>(other._trusted_memory);
+
         {
-            this_meta->parent_allocator->deallocate(_trusted_memory, this_meta->total_size);
+            std::scoped_lock lock(this_meta->mtx, other_meta->mtx);
+
+            old_memory = _trusted_memory;
+            old_parent = this_meta->parent_allocator;
+            old_allocated_size = this_meta->allocated_size;
+
+            _trusted_memory = other._trusted_memory;
+            other._trusted_memory = nullptr;
         }
+
+        reinterpret_cast<allocator_meta*>(old_memory)->~allocator_meta();
+        old_parent->deallocate(old_memory, old_allocated_size);
+    }
+    else if (_trusted_memory != nullptr) {
+        auto* this_meta = reinterpret_cast<allocator_meta*>(_trusted_memory);
+
+        {
+            std::lock_guard<std::mutex> lock(this_meta->mtx);
+
+            old_memory = _trusted_memory;
+            old_parent = this_meta->parent_allocator;
+            old_allocated_size = this_meta->allocated_size;
+
+            _trusted_memory = nullptr;
+        }
+
+        reinterpret_cast<allocator_meta*>(old_memory)->~allocator_meta();
+        old_parent->deallocate(old_memory, old_allocated_size);
+    }
+    else if (other._trusted_memory != nullptr) {
+        auto* other_meta = reinterpret_cast<allocator_meta*>(other._trusted_memory);
+
+        std::lock_guard<std::mutex> lock(other_meta->mtx);
         _trusted_memory = other._trusted_memory;
         other._trusted_memory = nullptr;
     }
+
     return *this;
 }
 

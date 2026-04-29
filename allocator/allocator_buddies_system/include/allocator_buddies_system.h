@@ -4,8 +4,9 @@
 #include <pp_allocator.h>
 #include <allocator_test_utils.h>
 #include <allocator_with_fit_mode.h>
+#include <iterator>
 #include <mutex>
-#include <cmath>
+#include <memory_resource>
 
 namespace __detail
 {
@@ -37,6 +38,14 @@ class allocator_buddies_system final:
 
 private:
 
+    struct allocator_meta
+    {
+        std::pmr::memory_resource *parent_allocator;
+        allocator_with_fit_mode::fit_mode mode;
+        unsigned char pool_size_power;
+        size_t allocated_size;
+        std::mutex mtx;
+    };
 
     struct block_metadata
     {
@@ -44,15 +53,17 @@ private:
         unsigned char size : 7;
     };
 
+    struct alignas(std::max_align_t) occupied_block_metadata
+    {
+        block_metadata meta;
+        void *owner;
+    };
+
     void *_trusted_memory;
 
-    /**
-     * TODO: You must improve it for alignment support
-     */
+    static constexpr const size_t allocator_metadata_size = sizeof(allocator_meta);
 
-    static constexpr const size_t allocator_metadata_size = sizeof(allocator_dbg_helper*) + sizeof(fit_mode) + sizeof(unsigned char) + sizeof(std::mutex);
-
-    static constexpr const size_t occupied_block_metadata_size = sizeof(block_metadata) + sizeof(void*);
+    static constexpr const size_t occupied_block_metadata_size = sizeof(occupied_block_metadata);
 
     static constexpr const size_t free_block_metadata_size = sizeof(block_metadata);
 
@@ -66,10 +77,10 @@ public:
             allocator_with_fit_mode::fit_mode allocate_fit_mode = allocator_with_fit_mode::fit_mode::first_fit);
 
     allocator_buddies_system(
-        allocator_buddies_system const &other);
+        allocator_buddies_system const &other) = delete;
     
     allocator_buddies_system &operator=(
-        allocator_buddies_system const &other);
+        allocator_buddies_system const &other) = delete;
     
     allocator_buddies_system(
         allocator_buddies_system &&other) noexcept;
@@ -104,6 +115,9 @@ private:
     class buddy_iterator
     {
         void* _block;
+        void* _trusted_memory;
+
+        friend class allocator_buddies_system;
 
     public:
 

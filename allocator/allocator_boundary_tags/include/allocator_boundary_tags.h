@@ -127,6 +127,8 @@ private:
 
         void* get_ptr() const noexcept;
 
+        std::byte *pool_begin_bytes() const noexcept;
+
         boundary_iterator();
 
         boundary_iterator(void* trusted);
