@@ -5,6 +5,8 @@
 #include <allocator_test_utils.h>
 #include <allocator_with_fit_mode.h>
 #include <mutex>
+#include <cstddef>
+#include <functional>
 
 class allocator_red_black_tree final:
     public smart_mem_resource,
@@ -17,27 +19,42 @@ private:
     enum class block_color : unsigned char
     { RED, BLACK };
 
-    struct block_data
+    struct allocator_meta
     {
-        bool occupied : 4;
-        block_color color : 4;
+        std::pmr::memory_resource *parent_allocator;
+        allocator_with_fit_mode::fit_mode mode;
+        size_t total_size;
+        size_t allocated_size;
+        std::mutex mtx;
+        void *free_root;
+    };
+
+    struct alignas(std::max_align_t) block_metadata
+    {
+        size_t size;
+        bool occupied;
+        block_color color;
+        block_metadata *parent;
+        block_metadata *left;
+        block_metadata *right;
+        void* owner;
     };
 
     void *_trusted_memory;
 
-    static constexpr const size_t allocator_metadata_size = sizeof(allocator_dbg_helper*) + sizeof(fit_mode) + sizeof(size_t) + sizeof(std::mutex) + sizeof(void*);
-    static constexpr const size_t occupied_block_metadata_size = sizeof(block_data) + 3 * sizeof(void*);
-    static constexpr const size_t free_block_metadata_size = sizeof(block_data) + 5 * sizeof(void*);
+    static constexpr const size_t allocator_metadata_size = sizeof(allocator_meta);
+    static constexpr const size_t occupied_block_metadata_size = sizeof(block_metadata);
+    static constexpr const size_t free_block_metadata_size = sizeof(block_metadata);
 
 public:
     
     ~allocator_red_black_tree() override;
     
     allocator_red_black_tree(
-        allocator_red_black_tree const &other);
+        allocator_red_black_tree const &other) = delete;
     
     allocator_red_black_tree &operator=(
-        allocator_red_black_tree const &other);
+        allocator_red_black_tree const &other) = delete;
     
     allocator_red_black_tree(
         allocator_red_black_tree &&other) noexcept;
@@ -67,6 +84,46 @@ private:
     inline void set_fit_mode(allocator_with_fit_mode::fit_mode mode) override;
 
 private:
+
+    using block_callback = std::function<void(block_metadata*)>;
+
+    void *begin_of_pool() const noexcept;
+
+    void *end_of_pool() const noexcept;
+
+    static block_color color_of(block_metadata *node) noexcept;
+
+    static void set_color(block_metadata *node, block_color color) noexcept;
+
+    static bool less_by_address(block_metadata *lhs, block_metadata *rhs) noexcept;
+
+    void rotate_left(block_metadata *node) noexcept;
+
+    void rotate_right(block_metadata *node) noexcept;
+
+    void insert_fixup(block_metadata *node) noexcept;
+
+    void insert_free_block(block_metadata *block) noexcept;
+
+    static block_metadata *minimum(block_metadata *node) noexcept;
+
+    void transplant(block_metadata *from, block_metadata *to) noexcept;
+
+    void delete_fixup(block_metadata *node, block_metadata *parent) noexcept;
+
+    void remove_free_block(block_metadata *block) noexcept;
+
+    void walk_free_tree(block_metadata *node, block_callback callback) const;
+
+    block_metadata *find_suitable_block(size_t size) const;
+
+    block_metadata *next_physical(block_metadata *block) const noexcept;
+
+    block_metadata *previous_physical(block_metadata *block) const noexcept;
+
+    bool owns_block(block_metadata *block) const noexcept;
+
+    void release_trusted_memory() noexcept;
 
     std::vector<allocator_test_utils::block_info> get_blocks_info_inner() const override;
 
